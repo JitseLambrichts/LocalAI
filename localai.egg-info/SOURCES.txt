@@ -1,0 +1,14 @@
+pyproject.toml
+localai/__init__.py
+localai/__main__.py
+localai/cli.py
+localai/hardware.py
+localai/models.py
+localai/ollama.py
+localai/recommender.py
+localai.egg-info/PKG-INFO
+localai.egg-info/SOURCES.txt
+localai.egg-info/dependency_links.txt
+localai.egg-info/entry_points.txt
+localai.egg-info/requires.txt
+localai.egg-info/top_level.txt
