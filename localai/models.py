@@ -1,11 +1,20 @@
 """
-Ollama model database.
+Ollama model database — fetched live from the Ollama library.
 
-A curated list of popular Ollama models with their hardware requirements,
-capabilities, and quality ratings.
+Scrapes the official model listing at https://ollama.com/search to get
+all available models with their capabilities and size variants, then
+estimates hardware requirements for each.
 """
 
+import json
+import re
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, field
+
+OLLAMA_SEARCH_URL = "https://ollama.com/search"
+OLLAMA_API_TAGS_URL = "https://ollama.com/api/tags"
+FETCH_TIMEOUT = 15  # seconds
 
 
 @dataclass
@@ -42,174 +51,380 @@ class OllamaModel:
             "reasoning": "🧠",
             "rag": "📚",
             "math": "🔢",
+            "embedding": "🔗",
+            "tools": "🔧",
         }
         return " ".join(icons.get(c, "•") for c in self.capabilities)
 
 
-# ─── Curated Model Database ──────────────────────────────────────────
-# All sizes assume Q4_K_M quantization (Ollama default).
-# VRAM estimates include ~0.5-1 GB overhead for KV cache at default context.
+# ─── Helper Functions ────────────────────────────────────────────────
 
-MODEL_DATABASE: list[OllamaModel] = [
-    # ── Tiny Models (< 2 GB VRAM) ────────────────────────────────────
-    OllamaModel(
-        name="tinyllama", variant="1.1b",
-        parameters=1.1, size_gb=0.6, vram_gb=1.0,
-        capabilities=["chat"],
-        quality_tier=1,
-        description="Ultra-light model for basic chat on minimal hardware",
-    ),
-    OllamaModel(
-        name="llama3.2", variant="1b",
-        parameters=1.0, size_gb=1.3, vram_gb=1.5,
-        capabilities=["chat"],
-        quality_tier=2,
-        description="Compact Meta model, great for simple tasks",
-    ),
+def _parse_parameters(variant: str) -> float:
+    """
+    Parse parameter count from a variant tag string.
 
-    # ── Small Models (2-4 GB VRAM) ───────────────────────────────────
-    OllamaModel(
-        name="llama3.2", variant="3b",
-        parameters=3.0, size_gb=2.0, vram_gb=3.0,
-        capabilities=["chat", "code"],
-        quality_tier=3,
-        description="Good balance of speed and quality for everyday use",
-    ),
-    OllamaModel(
-        name="phi4-mini", variant="3.8b",
-        parameters=3.8, size_gb=2.5, vram_gb=3.5,
-        capabilities=["chat", "code", "reasoning"],
-        quality_tier=3,
-        description="Microsoft's compact model, surprisingly smart for its size",
-    ),
-    OllamaModel(
-        name="gemma3", variant="4b",
-        parameters=4.0, size_gb=3.3, vram_gb=4.0,
-        capabilities=["chat", "vision"],
-        quality_tier=3,
-        description="Google's small model with vision capabilities",
-    ),
+    Examples:
+        "8b"   → 8.0
+        "3.8b" → 3.8
+        "235b" → 235.0
+        "1t"   → 1000.0
+        "0.6b" → 0.6
+        "latest" → 0.0 (unknown)
+    """
+    variant = variant.lower().strip()
 
-    # ── Medium Models (4-8 GB VRAM) ──────────────────────────────────
-    OllamaModel(
-        name="llama3.1", variant="8b",
-        parameters=8.0, size_gb=4.9, vram_gb=6.0,
-        capabilities=["chat", "code"],
-        quality_tier=4,
-        description="Meta's flagship 8B — the community favorite",
-    ),
-    OllamaModel(
-        name="mistral", variant="7b",
-        parameters=7.0, size_gb=4.1, vram_gb=6.0,
-        capabilities=["chat", "code"],
-        quality_tier=4,
-        description="Fast and efficient European model, great for chat",
-    ),
-    OllamaModel(
-        name="qwen3", variant="8b",
-        parameters=8.0, size_gb=4.9, vram_gb=6.0,
-        capabilities=["chat", "code", "math"],
-        quality_tier=4,
-        description="Alibaba's versatile model, excels at reasoning and math",
-    ),
-    OllamaModel(
-        name="deepseek-r1", variant="8b",
-        parameters=8.0, size_gb=4.9, vram_gb=6.0,
-        capabilities=["chat", "reasoning", "code"],
-        quality_tier=4,
-        description="DeepSeek's reasoning model with chain-of-thought",
-    ),
-    OllamaModel(
-        name="codellama", variant="7b",
-        parameters=7.0, size_gb=3.8, vram_gb=6.0,
-        capabilities=["code"],
-        quality_tier=3,
-        description="Specialized for code generation and completion",
-    ),
+    match = re.match(r"^(\d+(?:\.\d+)?)b$", variant)
+    if match:
+        return float(match.group(1))
 
-    # ── Large Models (8-16 GB VRAM) ──────────────────────────────────
-    OllamaModel(
-        name="gemma3", variant="12b",
-        parameters=12.0, size_gb=8.1, vram_gb=10.0,
-        capabilities=["chat", "vision"],
-        quality_tier=4,
-        description="Google's mid-size model with strong vision capabilities",
-    ),
-    OllamaModel(
-        name="llama3.2-vision", variant="11b",
-        parameters=11.0, size_gb=7.9, vram_gb=10.0,
-        capabilities=["chat", "vision"],
-        quality_tier=4,
-        description="Meta's vision-language model, understands images",
-    ),
-    OllamaModel(
-        name="codellama", variant="13b",
-        parameters=13.0, size_gb=7.4, vram_gb=10.0,
-        capabilities=["code"],
-        quality_tier=4,
-        description="Larger code model for complex programming tasks",
-    ),
+    match = re.match(r"^(\d+(?:\.\d+)?)t$", variant)
+    if match:
+        return float(match.group(1)) * 1000
 
-    # ── XL Models (16-24 GB VRAM) ────────────────────────────────────
-    OllamaModel(
-        name="codellama", variant="34b",
-        parameters=34.0, size_gb=19.0, vram_gb=22.0,
-        capabilities=["code"],
-        quality_tier=4,
-        description="Top-tier code model for professional development",
-    ),
-    OllamaModel(
-        name="gemma3", variant="27b",
-        parameters=27.0, size_gb=17.0, vram_gb=20.0,
-        capabilities=["chat", "vision"],
-        quality_tier=5,
-        description="Google's high-quality model, rivals much larger models",
-    ),
-    OllamaModel(
-        name="qwen3", variant="32b",
-        parameters=32.0, size_gb=20.0, vram_gb=24.0,
-        capabilities=["chat", "code", "math", "reasoning"],
-        quality_tier=5,
-        description="Alibaba's powerhouse, excellent across all tasks",
-    ),
-    OllamaModel(
-        name="command-r", variant="35b",
-        parameters=35.0, size_gb=20.0, vram_gb=24.0,
-        capabilities=["chat", "rag"],
-        quality_tier=4,
-        description="Cohere's model optimized for RAG workflows",
-    ),
+    return 0.0
 
-    # ── XXL Models (48+ GB VRAM) ─────────────────────────────────────
-    OllamaModel(
-        name="llama3.1", variant="70b",
-        parameters=70.0, size_gb=43.0, vram_gb=48.0,
-        capabilities=["chat", "code"],
-        quality_tier=5,
-        description="Meta's largest open model — near-GPT-4 quality",
-    ),
-    OllamaModel(
-        name="deepseek-r1", variant="70b",
-        parameters=70.0, size_gb=43.0, vram_gb=48.0,
-        capabilities=["chat", "reasoning", "code"],
-        quality_tier=5,
-        description="DeepSeek's large reasoning model, exceptional quality",
-    ),
-    OllamaModel(
-        name="qwen3", variant="235b",
-        parameters=235.0, size_gb=142.0, vram_gb=160.0,
-        capabilities=["chat", "code", "math", "reasoning"],
-        quality_tier=5,
-        description="Alibaba's flagship — truly massive, datacenter-grade",
-    ),
-]
 
+def _estimate_size_gb(parameters: float) -> float:
+    """
+    Estimate download size in GB from parameter count.
+
+    Rule of thumb for Q4_K_M quantization:
+    ~0.5-0.6 GB per billion parameters.
+    """
+    if parameters <= 0:
+        return 0.0
+    return round(parameters * 0.55, 1)
+
+
+def _estimate_vram(size_gb: float) -> float:
+    """
+    Estimate minimum VRAM needed from the download size.
+
+    At runtime, Ollama needs extra memory for the KV cache,
+    compute buffers, and overhead (~25%).
+    """
+    return round(size_gb * 1.25, 1)
+
+
+def _parse_capabilities(cap_tags: list[str], model_name: str) -> list[str]:
+    """
+    Build a capability list from HTML tags and model name.
+
+    cap_tags come from the search page (e.g. ['vision', 'tools', 'thinking']).
+    Additional capabilities are inferred from the model name.
+    """
+    caps = []
+    name_lower = model_name.lower()
+    tag_set = {t.lower() for t in cap_tags}
+
+    # Vision
+    if "vision" in tag_set or any(kw in name_lower for kw in ["vl", "vision", "llava", "ocr"]):
+        caps.append("vision")
+
+    # Code
+    if any(kw in name_lower for kw in ["code", "coder", "starcoder", "devstral"]):
+        caps.append("code")
+
+    # Reasoning / thinking
+    if "thinking" in tag_set or any(kw in name_lower for kw in ["r1", "r2", "thinking", "reason", "cogito"]):
+        caps.append("reasoning")
+
+    # Tools / function calling
+    if "tools" in tag_set:
+        caps.append("tools")
+
+    # Embedding
+    if "embedding" in tag_set or "embed" in name_lower:
+        caps.append("embedding")
+
+    # RAG
+    if any(kw in name_lower for kw in ["command-r", "rag"]):
+        caps.append("rag")
+
+    # Math
+    if any(kw in name_lower for kw in ["math", "wizard-math"]):
+        caps.append("math")
+
+    # Default: everything is at least a chat model (unless embedding-only)
+    if "embedding" not in caps:
+        caps.insert(0, "chat")
+
+    return caps
+
+
+def _estimate_quality_tier(parameters: float) -> int:
+    """
+    Assign a quality tier (1-5) based on parameter count.
+    """
+    if parameters <= 0:
+        return 3
+    if parameters < 2:
+        return 1
+    if parameters < 5:
+        return 2
+    if parameters < 15:
+        return 3
+    if parameters < 40:
+        return 4
+    return 5
+
+
+# ─── Search Page Scraper ─────────────────────────────────────────────
+
+def _scrape_search_page(url: str) -> str:
+    """Fetch a single search page and return the HTML."""
+    req = urllib.request.Request(url, headers={"User-Agent": "LocalAI/1.0"})
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        return resp.read().decode("utf-8")
+
+
+def _parse_model_cards(html: str) -> list[dict]:
+    """
+    Parse model cards from the Ollama search page HTML.
+
+    Each model card is a list item with a link to /library/<name>
+    containing: description, capability tags, and size variants.
+
+    Returns a list of dicts with keys:
+      name, description, capabilities, sizes
+    """
+    models = []
+
+    # Split HTML into model blocks using the library links as delimiters
+    # Each block starts with href="/library/<name>" and contains the card data
+    blocks = re.split(r'(?=href="/library/)', html)
+
+    for block in blocks:
+        # Extract model name
+        name_match = re.search(r'href="/library/([^"]+)"', block)
+        if not name_match:
+            continue
+        model_name = name_match.group(1)
+
+        # Skip duplicates within the same block (cards appear twice in the HTML)
+        # and skip non-model paths like "/library/modelname/tags"
+        if "/" in model_name:
+            continue
+
+        # Extract description by stripping HTML first, then finding text after model name
+        desc = ""
+        clean_text = re.sub(r'<[^>]+>', ' ', block)  # Strip all HTML tags
+        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+        desc_match = re.search(
+            rf'{re.escape(model_name)}\s+(.+?)(?:vision|tools|thinking|embedding|cloud|code|\d+(?:\.\d+)?b|\d+[\d,.]*[KM]\s*Pulls)',
+            clean_text,
+            re.IGNORECASE,
+        )
+        if desc_match:
+            raw_desc = desc_match.group(1).strip().rstrip('.')
+            # Remove leftover class names, CSS-like content
+            raw_desc = re.sub(r'class=\S+', '', raw_desc)
+            raw_desc = re.sub(r'["\']', '', raw_desc)
+            raw_desc = re.sub(r'\s+', ' ', raw_desc).strip()
+            if len(raw_desc) > 15 and not raw_desc.startswith('group'):
+                desc = raw_desc
+
+        # Extract capability tags (vision, tools, thinking, embedding, cloud, code)
+        cap_tags = re.findall(
+            r'>(vision|tools|thinking|embedding|code)<',
+            block[:3000],
+            re.IGNORECASE,
+        )
+
+        # Extract size variants (0.8b, 2b, 4b, 9b, 27b, etc.)
+        sizes = re.findall(r'>(\d+(?:\.\d+)?b)<', block[:3000], re.IGNORECASE)
+
+        # Deduplicate
+        sizes = list(dict.fromkeys(sizes))
+        cap_tags = list(dict.fromkeys(cap_tags))
+
+        # If no sizes found, add "latest" as default
+        if not sizes:
+            sizes = ["latest"]
+
+        models.append({
+            "name": model_name,
+            "description": desc,
+            "capabilities": cap_tags,
+            "sizes": sizes,
+        })
+
+    # Deduplicate by name (cards appear twice in the HTML)
+    seen = set()
+    unique = []
+    for m in models:
+        if m["name"] not in seen:
+            seen.add(m["name"])
+            unique.append(m)
+
+    return unique
+
+
+def _fetch_all_search_pages() -> list[dict]:
+    """
+    Fetch all pages of the Ollama search listing.
+
+    Returns a deduplicated list of model card dicts from all pages.
+    """
+    all_models: dict[str, dict] = {}  # name -> card
+    page = 1
+    max_pages = 20  # Safety limit
+
+    while page <= max_pages:
+        url = f"{OLLAMA_SEARCH_URL}?p={page}" if page > 1 else OLLAMA_SEARCH_URL
+
+        try:
+            html = _scrape_search_page(url)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            break
+
+        models = _parse_model_cards(html)
+        if not models:
+            break  # No more models — we've passed the last page
+
+        for m in models:
+            if m["name"] not in all_models:
+                all_models[m["name"]] = m
+
+        page += 1
+
+    return list(all_models.values())
+
+
+# ─── API Enrichment ──────────────────────────────────────────────────
+
+def _fetch_api_sizes() -> dict[str, int]:
+    """
+    Fetch model sizes from the /api/tags endpoint.
+
+    Returns a dict mapping "name:variant" → size_in_bytes.
+    This provides real download sizes for models that appear in the API.
+    """
+    try:
+        req = urllib.request.Request(
+            OLLAMA_API_TAGS_URL,
+            headers={"User-Agent": "LocalAI/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return {}
+
+    sizes = {}
+    for entry in data.get("models", []):
+        model_name = entry.get("name", "") or entry.get("model", "")
+        size_bytes = entry.get("size", 0)
+        if model_name and size_bytes > 0:
+            sizes[model_name.lower()] = size_bytes
+
+    return sizes
+
+
+# ─── Public Fetching ─────────────────────────────────────────────────
+
+def fetch_models_from_registry() -> list[OllamaModel]:
+    """
+    Fetch all official models from the Ollama library.
+
+    1. Scrapes ollama.com/search for model names, capabilities, and size variants
+    2. Enriches with real download sizes from /api/tags where available
+    3. Estimates sizes for variants not in the API
+
+    Returns an empty list if the fetch fails.
+    """
+    try:
+        model_cards = _fetch_all_search_pages()
+    except Exception:
+        return []
+
+    if not model_cards:
+        return []
+
+    # Get real sizes from the API for enrichment
+    api_sizes = _fetch_api_sizes()
+
+    seen: set[str] = set()  # Track name:variant to prevent duplicates
+    result: list[OllamaModel] = []
+
+    for card in model_cards:
+        name = card["name"]
+        description = card.get("description", "")
+        cap_tags = card.get("capabilities", [])
+
+        for size_tag in card["sizes"]:
+            variant = size_tag.lower()
+            parameters = _parse_parameters(variant)
+
+            # Skip "cloud" variants (these run on Ollama's servers, not locally)
+            if variant in ("cloud", "latest"):
+                # For "latest", check if we have API data
+                api_key = f"{name}:latest".lower()
+                alt_key = name.lower()
+                if api_key not in api_sizes and alt_key not in api_sizes:
+                    continue
+                # Use API data for "latest"
+                actual_bytes = api_sizes.get(api_key, api_sizes.get(alt_key, 0))
+                if actual_bytes > 0:
+                    size_gb = round(actual_bytes / (1024 ** 3), 1)
+                    if parameters <= 0:
+                        parameters = round(size_gb / 0.55, 1)
+                    variant = "latest"
+                else:
+                    continue
+
+            # Deduplicate by name:variant
+            dedup_key = f"{name}:{variant}".lower()
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            # Try to get real size from API
+            api_key = f"{name}:{variant}".lower()
+            if api_key in api_sizes:
+                size_gb = round(api_sizes[api_key] / (1024 ** 3), 1)
+            elif variant != "latest":
+                # Estimate from parameter count
+                size_gb = _estimate_size_gb(parameters)
+
+            if size_gb <= 0 and parameters <= 0:
+                continue
+
+            vram_gb = _estimate_vram(size_gb)
+            capabilities = _parse_capabilities(cap_tags, name)
+            quality_tier = _estimate_quality_tier(parameters)
+
+            # Build description
+            if not description:
+                param_str = f"{parameters:.0f}B" if parameters >= 1 else f"{parameters * 1000:.0f}M"
+                description_line = f"{name} ({param_str} parameters)"
+            else:
+                description_line = description
+
+            result.append(OllamaModel(
+                name=name,
+                variant=variant,
+                parameters=parameters,
+                size_gb=size_gb,
+                vram_gb=vram_gb,
+                capabilities=capabilities,
+                quality_tier=quality_tier,
+                description=description_line,
+            ))
+
+    return result
+
+
+# ─── Public API ──────────────────────────────────────────────────────
 
 def get_all_models() -> list[OllamaModel]:
-    """Return the full model database."""
-    return MODEL_DATABASE.copy()
+    """
+    Return the full model list from the Ollama registry.
+
+    Fetches live from ollama.com. Returns an empty list on failure.
+    """
+    return fetch_models_from_registry()
 
 
 def get_models_by_capability(capability: str) -> list[OllamaModel]:
     """Filter models by a specific capability."""
-    return [m for m in MODEL_DATABASE if capability in m.capabilities]
+    return [m for m in get_all_models() if capability in m.capabilities]

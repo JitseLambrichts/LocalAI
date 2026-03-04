@@ -347,14 +347,25 @@ def main() -> None:
     # ── Step 2: Check Ollama ─────────────────────────────────────────
     _print_ollama_status()
 
-    # ── Step 3: Get recommendations ──────────────────────────────────
+    # ── Step 3: Fetch models & get recommendations ─────────────────
     with console.status(
-        "[bold cyan]  🤖 Finding the best models for your hardware...",
+        "[bold cyan]  🌐 Fetching latest models from the Ollama library...",
         spinner="dots",
     ):
-        time.sleep(0.5)
         recommendations = get_recommendations(hw)
         top = get_top_pick(recommendations)
+
+    if not recommendations:
+        console.print(Panel(
+            "\n  ⚠️  Could not fetch models from the Ollama library.\n\n"
+            "  This usually means you are offline or ollama.com is unreachable.\n"
+            "  Please check your internet connection and try again.\n",
+            title="[bold yellow]No Models Available[/]",
+            border_style="yellow",
+            padding=(1, 2),
+        ))
+        console.print()
+        return
 
     # ── Step 4: Show results ─────────────────────────────────────────
     if top:
