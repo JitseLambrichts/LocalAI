@@ -16,12 +16,13 @@ from rich.padding import Padding
 from rich import box
 
 from localai.hardware import detect_hardware, HardwareInfo
-from localai.models import OllamaModel
+from localai.models import OllamaModel, get_all_models
 from localai.recommender import (
     get_recommendations,
     get_top_pick,
     get_recommendations_by_category,
     Recommendation,
+    _classify_performance,
 )
 from localai.ollama import (
     is_ollama_installed,
@@ -328,6 +329,117 @@ def _print_tips(hw: HardwareInfo) -> None:
         console.print()
 
 
+def _print_mode_selection() -> str:
+    """
+    Ask the user to choose between recommendations or model search.
+
+    Returns "recommend" or "search".
+    """
+    console.print()
+    console.print(Panel(
+        "  [bold]What would you like to do?[/]\n\n"
+        "  [bold cyan][1][/] [white]Get recommendations[/] \u2014 see the best models for your hardware\n"
+        "  [bold cyan][2][/] [white]Search a model[/]    \u2014 check if a specific model can run on your system",
+        title="[bold white]Choose a Mode[/]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+    console.print()
+
+    while True:
+        choice = console.input("  [bold cyan]Enter 1 or 2:[/] ").strip()
+        if choice in ("1", ""):
+            console.print()
+            return "recommend"
+        if choice == "2":
+            console.print()
+            return "search"
+        console.print("  [yellow]Please enter 1 or 2.[/]")
+
+
+def _run_search_mode(hw: HardwareInfo, all_models: list[OllamaModel]) -> None:
+    """Interactive model search: user types a name, we show compatibility."""
+    effective_vram = hw.effective_vram_gb
+
+    console.print("  [dim]Tip: search by partial name, e.g. 'qwen', 'llama', 'gemma', 'deepseek'[/]\n")
+
+    while True:
+        query = console.input(
+            "  [bold cyan]Search model name (or [bold]q[/] to quit):[/] "
+        ).strip().lower()
+
+        if query in ("q", "quit", "exit", ""):
+            break
+
+        # Find matching models (name contains the query)
+        matches = [m for m in all_models if query in m.name.lower() or query in m.full_name.lower()]
+
+        if not matches:
+            console.print(f"\n  [yellow]No models found matching '[bold]{query}[/]'.[/]")
+            console.print("  [dim]Tip: Try a partial name, e.g. 'qwen', 'llama', 'gemma'[/]\n")
+            continue
+
+        console.print()
+
+        # Group by model name
+        names: dict[str, list[OllamaModel]] = {}
+        for m in matches:
+            names.setdefault(m.name, []).append(m)
+
+        for name, variants in names.items():
+            # Use first variant's description (strip the parenthesised size if present)
+            raw_desc = variants[0].description
+            short_desc = raw_desc.split(" (")[0] if " (" in raw_desc else raw_desc[:60]
+
+            table = Table(
+                title=f"{name} \u2014 {short_desc}",
+                box=box.ROUNDED,
+                header_style="bold cyan",
+                border_style="dim",
+                show_lines=True,
+                padding=(0, 1),
+            )
+            table.add_column("Variant", style="bold white", min_width=16)
+            table.add_column("Params", justify="right", min_width=7)
+            table.add_column("Download", justify="right", min_width=9)
+            table.add_column("VRAM needed", justify="right", min_width=11)
+            table.add_column("Can run?", justify="center", min_width=12)
+            table.add_column("Speed", justify="center", min_width=10)
+            table.add_column("Type", min_width=8)
+
+            for m in sorted(variants, key=lambda x: x.parameters):
+                fits_vram = m.vram_gb <= effective_vram
+                fits_disk = m.size_gb <= hw.disk_available_gb
+
+                if not fits_vram:
+                    shortage = m.vram_gb - effective_vram
+                    can_run = "[red]\u2717 Too large[/]"
+                    speed_label = "\u2014"
+                    vram_str = f"[red]{m.vram_gb} GB (+{shortage:.1f})[/]"
+                elif not fits_disk:
+                    can_run = "[yellow]\u2717 No disk[/]"
+                    speed_label = "\u2014"
+                    vram_str = f"{m.vram_gb} GB"
+                else:
+                    perf, icon, _ = _classify_performance(m, effective_vram, hw.has_gpu)
+                    can_run = "[green]\u2713 Yes[/]"
+                    speed_label = f"{icon} {perf}"
+                    vram_str = f"{m.vram_gb} GB"
+
+                table.add_row(
+                    m.full_name,
+                    m.param_label,
+                    f"{m.size_gb} GB",
+                    vram_str,
+                    can_run,
+                    speed_label,
+                    m.capability_icons,
+                )
+
+            console.print(table)
+            console.print()
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     console.print()
@@ -347,15 +459,17 @@ def main() -> None:
     # ── Step 2: Check Ollama ─────────────────────────────────────────
     _print_ollama_status()
 
-    # ── Step 3: Fetch models & get recommendations ─────────────────
+    # ── Step 3: Mode selection ───────────────────────────────────────
+    mode = _print_mode_selection()
+
+    # ── Step 4: Fetch all models ─────────────────────────────────────
     with console.status(
         "[bold cyan]  🌐 Fetching latest models from the Ollama library...",
         spinner="dots",
     ):
-        recommendations = get_recommendations(hw)
-        top = get_top_pick(recommendations)
+        all_models = get_all_models()
 
-    if not recommendations:
+    if not all_models:
         console.print(Panel(
             "\n  ⚠️  Could not fetch models from the Ollama library.\n\n"
             "  This usually means you are offline or ollama.com is unreachable.\n"
@@ -367,37 +481,45 @@ def main() -> None:
         console.print()
         return
 
-    # ── Step 4: Show results ─────────────────────────────────────────
-    if top:
-        _print_top_pick(top)
-        console.print()
-        _print_category_picks(recommendations)
-        console.print()
-        _print_all_compatible(recommendations)
-        console.print()
-        _print_quick_start_guide()
+    # ── Step 5: Run selected mode ────────────────────────────────────
+    if mode == "search":
+        _run_search_mode(hw, all_models)
     else:
-        console.print(Panel(
-            "\n  😔 Unfortunately, no Ollama models seem to be compatible\n"
-            "  with your current hardware.\n\n"
-            "  [bold]Possible solutions:[/]\n"
-            "  • Close other applications to free up RAM\n"
-            "  • Upgrade to at least 8 GB RAM\n"
-            "  • Add a GPU with at least 4 GB VRAM\n",
-            title="[bold red]No Compatible Models[/]",
-            border_style="red",
-            padding=(1, 2),
-        ))
+        # Recommendations mode
+        from localai.recommender import get_recommendations, get_top_pick
+        recommendations = get_recommendations(hw)
+        top = get_top_pick(recommendations)
 
-    # ── Step 5: Hardware-specific tips ───────────────────────────────
-    _print_tips(hw)
+        if top:
+            _print_top_pick(top)
+            console.print()
+            _print_category_picks(recommendations)
+            console.print()
+            _print_all_compatible(recommendations)
+            console.print()
+            _print_quick_start_guide()
+        else:
+            console.print(Panel(
+                "\n  😔 Unfortunately, no Ollama models seem to be compatible\n"
+                "  with your current hardware.\n\n"
+                "  [bold]Possible solutions:[/]\n"
+                "  • Close other applications to free up RAM\n"
+                "  • Upgrade to at least 8 GB RAM\n"
+                "  • Add a GPU with at least 4 GB VRAM\n",
+                title="[bold red]No Compatible Models[/]",
+                border_style="red",
+                padding=(1, 2),
+            ))
 
-    # ── Footer ───────────────────────────────────────────────────────
-    console.print(
-        "  [dim]Made with ❤️  by LocalAI · "
-        f"{len(recommendations)} models compatible with your hardware[/]",
-    )
-    console.print()
+        # ── Hardware-specific tips ───────────────────────────────────
+        _print_tips(hw)
+
+        # ── Footer ──────────────────────────────────────────────────
+        console.print(
+            "  [dim]Made with ❤️  by LocalAI · "
+            f"{len(recommendations)} models compatible with your hardware[/]",
+        )
+        console.print()
 
 
 if __name__ == "__main__":
